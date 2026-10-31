@@ -1,0 +1,135 @@
+# Generated from the same layout as the Dockerfile. Regenerate instead of editing.
+#
+# Builds the weights-baked image on a standard GitHub-hosted runner (14 GB SSD) and pushes it to GHCR with
+# GITHUB_TOKEN. GHCR limits: 10 GB per layer, 10-minute upload timeout. So every GGUF part is its own layer, and
+# the image is built one step at a time: each step builds one Dockerfile stage with the previous step's pushed
+# image standing in for the stage before it (--build-context sNN=docker-image://...@digest), pushes by digest, and
+# prunes the build cache. The runner never holds more than one part (~3 x 2 GiB) and never pulls the base image.
+name: build-firered-edit-v11-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: image tag
+        required: true
+        default: firered-edit-v11-q6k-lightning-v1
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-firered-edit-v11-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      BUILDKIT_IMAGE: moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+      OUT_OPTS: oci-mediatypes=true,compression=gzip,compression-level=1
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Names and disk
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          echo "SOURCE_URL=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" >> "$GITHUB_ENV"
+          df -h / /mnt 2>/dev/null || df -h /
+          free_gb=$(df --output=avail -B1G / | tail -1 | tr -d ' ')
+          echo "free on /: ${free_gb} GB (need 12: one step holds ~3 x 2 GiB + the small fetcher image)"
+          [ "$free_gb" -ge 12 ]
+
+      - name: Log in to GHCR with GITHUB_TOKEN
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Pinned BuildKit builder
+        run: docker buildx create --name bk --driver docker-container --driver-opt "image=$BUILDKIT_IMAGE" --use --bootstrap
+
+      - name: Verify the split files (each streamed once, nothing stored) and record their part hashes
+        run: |
+          set -euo pipefail
+          for t in verify-unet-firered-edit-11-q6k verify-te-qwen25vl-7b-fp8; do
+            docker buildx build --builder bk --platform linux/amd64 --progress plain --target "$t" \
+              --output "type=local,dest=verify/$t" firered-edit-v11
+            docker buildx prune --builder bk --all --force > /dev/null
+          done
+          cat verify/*/*.json
+
+      - name: Build and push, one layer per step
+        timeout-minutes: 300
+        run: |
+          set -euo pipefail
+          prev=""
+          step() {   # target, stage it replaces ("-" = none), chain|final
+            local target=$1 replaces=$2 kind=$3 extra=() out
+            if [ "$replaces" != "-" ]; then extra=(--build-context "$replaces=docker-image://$IMAGE@$prev"); fi
+            if [ "$kind" = final ]; then out="type=image,name=$IMAGE:$TAG,push=true,$OUT_OPTS"
+            else out="type=image,name=$IMAGE,push-by-digest=true,push=true,$OUT_OPTS"; fi
+            for attempt in 1 2 3; do
+              if timeout 50m docker buildx build --builder bk --platform linux/amd64 --progress plain \
+                  --provenance=false --sbom=false --target "$target" --build-context verify-unet-firered-edit-11-q6k=verify/verify-unet-firered-edit-11-q6k --build-context verify-te-qwen25vl-7b-fp8=verify/verify-te-qwen25vl-7b-fp8 "${extra[@]}" \
+                  --build-arg SOURCE_URL="$SOURCE_URL" --output "$out" --metadata-file meta.json firered-edit-v11; then
+                break
+              fi
+              [ "$attempt" = 3 ] && { echo "step $target failed 3 times"; exit 1; }
+              echo "step $target attempt $attempt failed; retrying (pushed layers are reused)"; sleep 30
+            done
+            prev=$(python3 -c 'import json; print(json.load(open("meta.json"))["containerimage.digest"])')
+            echo "$target $prev" | tee -a steps.txt
+            docker buildx prune --builder bk --all --force > /dev/null
+            df -h / | tail -1
+          }
+          step s01  -     chain   # s01, 2,147,483,648 new bytes
+          step s02  s01   chain   # s02, 2,147,483,648 new bytes
+          step s03  s02   chain   # s03, 2,147,483,648 new bytes
+          step s04  s03   chain   # s04, 2,147,483,648 new bytes
+          step s05  s04   chain   # s05, 2,147,483,648 new bytes
+          step s06  s05   chain   # s06, 2,147,483,648 new bytes
+          step s07  s06   chain   # s07, 2,147,483,648 new bytes
+          step s08  s07   chain   # s08, 1,792,604,736 new bytes
+          step s09  s08   chain   # s09, 2,147,483,648 new bytes
+          step s10  s09   chain   # s10, 2,147,483,648 new bytes
+          step s11  s10   chain   # s11, 2,147,483,648 new bytes
+          step s12  s11   chain   # s12, 2,147,483,648 new bytes
+          step s13  s12   chain   # s13, 794,736,088 new bytes
+          step s18  s13   final   # s14,s15,s16,s17,s18, 1,103,349,022 new bytes
+          echo "REF=$IMAGE@$prev" >> "$GITHUB_ENV"
+          echo "DIGEST=$prev" >> "$GITHUB_ENV"
+
+      - name: Check the pushed image (size from the registry manifest)
+        run: |
+          set -euo pipefail
+          cat steps.txt
+          python3 - <<'PY'
+          import json, os, subprocess
+          raw = subprocess.run(["docker", "buildx", "imagetools", "inspect", "--raw", os.environ["REF"]],
+                               check=True, capture_output=True, text=True).stdout
+          m = json.loads(raw)
+          sizes = [l["size"] for l in m["layers"]]
+          total = sum(sizes) + m["config"]["size"]
+          lines = ["| | |", "|---|---|", "| image | `%s` |" % os.environ["REF"],
+                   "| layers | %d |" % len(sizes), "| compressed size | %s B (%.2f GB) |" % (format(total, ","), total / 1e9),
+                   "| largest layer | %s B |" % format(max(sizes), ",")]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          assert total < 35000000000, "image is %d B, over the 35 GB Salad limit" % total
+          assert max(sizes) < 10000000000, "a layer is over GHCR's 10 GB limit"
+          PY
+
+      - name: Anonymous pull check (works once the package is public)
+        run: |
+          set -u
+          name=${IMAGE#ghcr.io/}
+          tok=$(curl -fsS "https://ghcr.io/token?scope=repository:${name}:pull" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])') || tok=""
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${tok}" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' "https://ghcr.io/v2/${name}/manifests/${DIGEST}")
+          echo "anonymous manifest GET: HTTP ${code}" | tee -a "$GITHUB_STEP_SUMMARY"
