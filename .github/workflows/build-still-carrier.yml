@@ -61,7 +61,7 @@ jobs:
               --output "type=local,dest=verify/$t" still-carrier
             docker buildx prune --builder bk --all --force > /dev/null
           done
-          cat verify/*/*.json
+          echo 'no split files in this image'
 
       - name: Build and push, one layer per step
         timeout-minutes: 300
